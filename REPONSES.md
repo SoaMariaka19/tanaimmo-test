@@ -48,3 +48,30 @@ Code corrigé : `src/api/listings.ts`
 **Remarque sur le lien avec la Partie 3** : l'appel CRM synchrone (2-8s) avant la réponse est la cause directe du scénario d'incident — sous charge, chaque webhook bloque une connexion, le pool sature, le prestataire dépasse ses 10s et réessaie, ce qui ajoute encore plus de charge.
 
 Code corrigé : `src/api/payment-webhook.ts`
+
+---
+
+## Partie 3 — Gestion d'incident
+
+### 3.1 – Scénario
+
+**21h40 —** Ne rien casser. Dashboard (taux 5xx, latence p50/p95, RPS, connexions PostgreSQL actives) + logs filtrés sur les erreurs pour identifier la route en cause. Le début des erreurs (21h35) coïncide avec la campagne SMS lancée à 21h30 : le lien est quasi certain. Message bref à l'équipe, point toutes les 10 minutes, aucun déploiement dans la panique.
+
+**21h45 —** Hypothèses, dans l'ordre, sachant que l'extrait B est en production : **(1)** pool de connexions PostgreSQL saturé — la requête `listings` (`JOIN` + `jsonb_agg` + `GROUP BY`) tient chaque connexion longtemps ; **(2)** index manquant sur `listings(city, created_at)` → seq scan sous charge ; **(3)** webhook paiement synchrone, moins probable un soir de campagne SMS mais à vérifier si les paiements montent aussi. Vérification en 2 minutes : `pg_stat_activity` (saturation), `pg_stat_statements` trié par `mean_exec_time` + `EXPLAIN ANALYZE` (index).
+*Message client :* « Dégradation identifiée, liée au pic de trafic de votre campagne. Le site reste accessible mais ralenti, nos équipes sont dessus, prochain point dans 15 minutes. »
+
+**21h55 —** Mitigation sans attendre la cause exacte, par risque croissant : cache HTTP court sur `/api/listings` (`Cache-Control: public, max-age=30, stale-while-revalidate=60`) ; rate limit (20 req/min/IP) ; si `EXPLAIN` confirme le seq scan, `CREATE INDEX CONCURRENTLY idx_listings_city_created ON listings(city, created_at DESC)` (`CONCURRENTLY` pour ne pas bloquer les écritures) ; si le pool est saturé et le CPU encore correct, augmenter temporairement sa taille — jamais si le CPU est déjà à 100 %.
+
+**22h00 —** *Message client :* « En cours de stabilisation, cause probable identifiée côté base, retour à la normale attendu sous 30 minutes. »
+
+**22h10 —** Taux d'erreur redescendu sous 2 %. *Message client :* « Taux d'erreur redescendu sous 2 %, la campagne peut continuer, point complet demain matin. » Règle constante : ne jamais promettre un délai non tenu, ne jamais annoncer « c'est réglé » avant 10 minutes stables.
+
+**Le lendemain —** Post-mortem écrit (blameless), diffusé au client et à l'équipe. Vérifier que les mitigations temporaires sont pérennisées (index toujours en place, cache configuré proprement, pas juste posé en urgence). Revoir la requête `listings` avec `EXPLAIN ANALYZE` sur un volume réaliste, tester en charge (k6/artillery). Basculer le travail synchrone du webhook paiement dans une file asynchrone (BullMQ/SQS). Mettre en place les alertes du 3.2, absentes ce soir-là.
+
+### 3.2 – Avant le lancement
+
+1. **Taux de 5xx API** : warning à 2 % sur 2 min, critical à 5 % sur 1 min — Prometheus + Alertmanager.
+2. **Latence p95 `/api/listings`** : > 1,5 s pendant 3 min — Grafana sur histogramme Prometheus.
+3. **Saturation du pool PostgreSQL** : connexions actives > 80 % du max pendant 2 min — postgres_exporter + Prometheus.
+4. **Échecs du webhook paiement** : > 1 % sur 5 min ou > 3 événements en dead-letter — métrique applicative + Sentry.
+   Une alerte qui se déclenche à 35 % de 5xx arrive déjà trop tard — c'est exactement ce qui s'est passé vendredi.
